@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Odoo MCP Server - BZHandiBreizh</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+    h1 { color: #6b46c1; }
+    code { background: #f3f4f6; padding: 4px 8px; border-radius: 4px; }
+    .status { color: green; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>🦁 Odoo MCP Server</h1>
+  <p class="status">✅ Serveur actif</p>
+  <p>Ce serveur connecte Claude à Odoo via le protocole MCP.</p>
+  <h2>Endpoints</h2>
+  <ul>
+    <li><code>POST /mcp</code> — Endpoint MCP principal</li>
+    <li><code>GET /health</code> — Vérification de l'état</li>
+  </ul>
+  <h2>Configuration Claude.ai</h2>
+  <p>Ajoutez dans Paramètres → Intégrations :</p>
+  <code id="url"></code>
+  <script>
+    document.getElementById('url').textContent = window.location.origin + '/mcp';
+  </script>
+  <p><small>BZHandiBreizh - Morbihan, Bretagne 🐦</small></p>
+</body>
+</html>
