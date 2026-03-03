@@ -2,22 +2,18 @@ const https = require("https");
 const http = require("http");
 const { URL } = require("url");
 
-// ─── HTTP POST natif ─────────────────────────────────────────────────────────
+// ─── HTTP POST ───────────────────────────────────────────────────────────────
 
-function post(urlStr, body, contentType) {
+function post(urlStr, body, ct) {
   return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const lib = url.protocol === "https:" ? https : http;
+    const u = new URL(urlStr);
+    const lib = u.protocol === "https:" ? https : http;
     const buf = Buffer.from(body, "utf8");
     const req = lib.request({
-      hostname: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: url.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": buf.length
-      }
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: u.pathname, method: "POST",
+      headers: { "Content-Type": ct, "Content-Length": buf.length }
     }, (res) => {
       let data = "";
       res.on("data", c => data += c);
@@ -25,188 +21,219 @@ function post(urlStr, body, contentType) {
     });
     req.on("error", reject);
     req.setTimeout(25000, () => { req.destroy(); reject(new Error("Timeout")); });
-    req.write(buf);
-    req.end();
+    req.write(buf); req.end();
   });
 }
 
-// ─── XML-RPC (supporte les clés API Odoo) ───────────────────────────────────
+// ─── XML-RPC Parser correct ──────────────────────────────────────────────────
 
-function xmlrpcValue(v) {
-  if (v === null || v === undefined) return "<value><boolean>0</boolean></value>";
-  if (typeof v === "boolean") return `<value><boolean>${v ? 1 : 0}</boolean></value>`;
-  if (typeof v === "number") return Number.isInteger(v) ? `<value><int>${v}</int></value>` : `<value><double>${v}</double></value>`;
-  if (typeof v === "string") return `<value><string>${v.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</string></value>`;
-  if (Array.isArray(v)) return `<value><array><data>${v.map(xmlrpcValue).join("")}</data></array></value>`;
-  if (typeof v === "object") {
-    const members = Object.entries(v).map(([k,val]) =>
-      `<member><name>${k}</name>${xmlrpcValue(val)}</member>`
-    ).join("");
-    return `<value><struct>${members}</struct></value>`;
+// Find content between first matching open/close tag pair
+function getTag(xml, tag) {
+  const open = xml.indexOf(`<${tag}`);
+  if (open === -1) return null;
+  const contentStart = xml.indexOf(">", open) + 1;
+  const close = `</${tag}>`;
+  // Find closing tag, counting nesting
+  let depth = 1, pos = contentStart;
+  while (depth > 0) {
+    const nextOpen = xml.indexOf(`<${tag}`, pos);
+    const nextClose = xml.indexOf(close, pos);
+    if (nextClose === -1) return null;
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      depth++;
+      pos = nextOpen + tag.length + 2;
+    } else {
+      depth--;
+      if (depth === 0) return xml.slice(contentStart, nextClose);
+      pos = nextClose + close.length;
+    }
   }
-  return `<value><string>${String(v)}</string></value>`;
+  return null;
 }
 
-function buildXmlRpc(method, params) {
-  const paramXml = params.map(p => `<param>${xmlrpcValue(p)}</param>`).join("");
-  return `<?xml version="1.0"?><methodCall><methodName>${method}</methodName><params>${paramXml}</params></methodCall>`;
+// Get all <tag>...</tag> occurrences (non-nested)
+function getAllTags(xml, tag) {
+  const results = [];
+  let pos = 0;
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  while (true) {
+    const start = xml.indexOf(open, pos);
+    if (start === -1) break;
+    const end = xml.indexOf(close, start);
+    if (end === -1) break;
+    results.push(xml.slice(start + open.length, end));
+    pos = end + close.length;
+  }
+  return results;
 }
 
-function parseXmlRpcValue(node) {
-  // Simple parser for Odoo XML-RPC responses
-  // Extract int
-  const intM = node.match(/<int>(-?\d+)<\/int>/);
-  if (intM) return parseInt(intM[1]);
-  const i4M = node.match(/<i4>(-?\d+)<\/i4>/);
-  if (i4M) return parseInt(i4M[1]);
-  const dblM = node.match(/<double>([\d.e+-]+)<\/double>/);
+function parseValue(xml) {
+  xml = xml.trim();
+  // Strip outer <value>...</value> if present
+  if (xml.startsWith("<value>") || xml.startsWith("<value ")) {
+    const inner = getTag(xml, "value");
+    if (inner !== null) return parseValue(inner);
+  }
+
+  // int / i4 / i8
+  const intM = xml.match(/^<i[48]?>(-?\d+)<\/i[48]?>$/) || xml.match(/^<int>(-?\d+)<\/int>$/);
+  if (intM) return parseInt(intM[1], 10);
+
+  // double
+  const dblM = xml.match(/^<double>([\d.eE+\-]+)<\/double>$/);
   if (dblM) return parseFloat(dblM[1]);
-  const boolM = node.match(/<boolean>([01])<\/boolean>/);
+
+  // boolean
+  const boolM = xml.match(/^<boolean>([01])<\/boolean>$/);
   if (boolM) return boolM[1] === "1";
-  const strM = node.match(/<string>([\s\S]*?)<\/string>/);
-  if (strM) return strM[1].replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">");
-  if (node.includes("<nil/>") || node.includes("<nil />")) return null;
-  
-  // Array
-  const arrayM = node.match(/<array>\s*<data>([\s\S]*?)<\/data>\s*<\/array>/);
-  if (arrayM) {
+
+  // string
+  if (xml.startsWith("<string>") && xml.endsWith("</string>")) {
+    return xml.slice(8, -9).replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&apos;/g,"'").replace(/&quot;/g,'"');
+  }
+
+  // nil / base64 treat as string
+  if (xml === "<nil/>" || xml === "<nil />") return null;
+  if (xml.startsWith("<base64>")) return xml.slice(8, xml.indexOf("</base64>"));
+
+  // array
+  if (xml.includes("<array>")) {
+    const data = getTag(xml, "data");
+    if (data === null) return [];
+    // Parse each <value> in data
     const items = [];
-    const content = arrayM[1];
-    const valueRe = /<value>([\s\S]*?)<\/value>/g;
-    let m;
-    while ((m = valueRe.exec(content)) !== null) {
-      items.push(parseXmlRpcValue(m[1]));
+    let pos = 0;
+    while (true) {
+      const start = data.indexOf("<value>", pos);
+      if (start === -1) break;
+      const inner = getTag(data.slice(start), "value");
+      if (inner === null) break;
+      items.push(parseValue(inner));
+      // advance past this value tag
+      const end = data.indexOf("</value>", start);
+      pos = end + 8;
     }
     return items;
   }
-  
-  // Struct
-  const structM = node.match(/<struct>([\s\S]*?)<\/struct>/);
-  if (structM) {
+
+  // struct
+  if (xml.includes("<struct>")) {
+    const struct = getTag(xml, "struct");
+    if (struct === null) return {};
     const obj = {};
-    const memberRe = /<member>\s*<name>([\s\S]*?)<\/name>\s*<value>([\s\S]*?)<\/value>\s*<\/member>/g;
-    let m;
-    while ((m = memberRe.exec(structM[1])) !== null) {
-      obj[m[1]] = parseXmlRpcValue(m[2]);
+    let pos = 0;
+    while (true) {
+      const mStart = struct.indexOf("<member>", pos);
+      if (mStart === -1) break;
+      const mEnd = struct.indexOf("</member>", mStart);
+      if (mEnd === -1) break;
+      const member = struct.slice(mStart + 8, mEnd);
+      const nameContent = getTag(member, "name");
+      const valContent = getTag(member, "value");
+      if (nameContent !== null && valContent !== null) {
+        obj[nameContent.trim()] = parseValue(valContent);
+      }
+      pos = mEnd + 9;
     }
     return obj;
   }
-  
-  // Plain value (no tag)
-  const stripped = node.replace(/<[^>]+>/g, "").trim();
-  if (stripped) return stripped;
-  return null;
+
+  // Plain text (no tags) - treat as string
+  const stripped = xml.replace(/<[^>]+>/g, "").trim();
+  return stripped || null;
 }
 
 function parseXmlRpcResponse(xml) {
   if (xml.includes("<fault>")) {
-    const valueM = xml.match(/<fault>\s*<value>([\s\S]*?)<\/value>\s*<\/fault>/);
-    const fault = valueM ? parseXmlRpcValue(valueM[1]) : { faultString: "Unknown fault" };
-    throw new Error("XML-RPC Fault: " + (fault.faultString || JSON.stringify(fault)));
+    const faultXml = getTag(xml, "fault");
+    const fault = parseValue(faultXml || "");
+    throw new Error("Odoo Fault: " + (fault && fault.faultString ? fault.faultString : JSON.stringify(fault)));
   }
-  const paramM = xml.match(/<params>\s*<param>\s*<value>([\s\S]*?)<\/value>\s*<\/param>\s*<\/params>/);
-  if (!paramM) throw new Error("Réponse XML-RPC invalide: " + xml.slice(0, 200));
-  return parseXmlRpcValue(paramM[1]);
+  const paramsXml = getTag(xml, "params");
+  if (!paramsXml) throw new Error("Réponse XML-RPC invalide:\n" + xml.slice(0, 500));
+  const paramXml = getTag(paramsXml, "param");
+  const valueXml = getTag(paramXml || paramsXml, "value");
+  return parseValue(valueXml || paramXml || paramsXml);
 }
 
-async function xmlrpc(baseUrl, path, method, params) {
-  const body = buildXmlRpc(method, params);
-  const xml = await post(baseUrl + path, body, "text/xml");
-  return parseXmlRpcResponse(xml);
+// ─── XML-RPC Builder ─────────────────────────────────────────────────────────
+
+function v(val) {
+  if (val === null || val === undefined) return "<value><nil/></value>";
+  if (typeof val === "boolean") return `<value><boolean>${val ? 1 : 0}</boolean></value>`;
+  if (typeof val === "number") return Number.isInteger(val) ? `<value><int>${val}</int></value>` : `<value><double>${val}</double></value>`;
+  if (typeof val === "string") return `<value><string>${val.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</string></value>`;
+  if (Array.isArray(val)) return `<value><array><data>${val.map(v).join("")}</data></array></value>`;
+  if (typeof val === "object") {
+    const m = Object.entries(val).map(([k,vv]) => `<member><name>${k}</name>${v(vv)}</member>`).join("");
+    return `<value><struct>${m}</struct></value>`;
+  }
+  return `<value><string>${String(val)}</string></value>`;
 }
 
-// ─── Odoo via XML-RPC ────────────────────────────────────────────────────────
+function buildCall(method, params) {
+  return `<?xml version="1.0"?><methodCall><methodName>${method}</methodName><params>${params.map(p => `<param>${v(p)}</param>`).join("")}</params></methodCall>`;
+}
+
+// ─── Odoo XML-RPC ────────────────────────────────────────────────────────────
 
 function getCfg() {
   const url = process.env.ODOO_URL;
   const db = process.env.ODOO_DATABASE;
   const login = process.env.ODOO_USERNAME;
   const apiKey = process.env.ODOO_API_KEY || process.env.ODOO_PASSWORD;
-  if (!url || !db || !login || !apiKey) {
-    throw new Error("Variables manquantes: ODOO_URL, ODOO_DATABASE, ODOO_USERNAME, ODOO_API_KEY");
-  }
+  if (!url || !db || !login || !apiKey) throw new Error("Config manquante: ODOO_URL, ODOO_DATABASE, ODOO_USERNAME, ODOO_API_KEY");
   return { url: url.replace(/\/$/, ""), db, login, apiKey };
 }
 
+async function xmlrpc(url, path, method, params) {
+  const xml = await post(url + path, buildCall(method, params), "text/xml; charset=utf-8");
+  return parseXmlRpcResponse(xml);
+}
+
 async function getUid(cfg) {
-  const uid = await xmlrpc(cfg.url, "/xmlrpc/2/common", "authenticate", [
-    cfg.db, cfg.login, cfg.apiKey, {}
-  ]);
-  if (!uid || uid === false) throw new Error("Auth Odoo échouée - vérifiez login et clé API");
+  const uid = await xmlrpc(cfg.url, "/xmlrpc/2/common", "authenticate", [cfg.db, cfg.login, cfg.apiKey, {}]);
+  if (!uid) throw new Error("Auth Odoo échouée. Vérifiez ODOO_USERNAME et ODOO_API_KEY.");
   return uid;
 }
 
-async function execute(cfg, uid, model, method, args, kwargs) {
+async function exec(cfg, uid, model, method, args, kwargs) {
   return xmlrpc(cfg.url, "/xmlrpc/2/object", "execute_kw", [
-    cfg.db, uid, cfg.apiKey,
-    model, method,
-    args || [],
-    kwargs || {}
+    cfg.db, uid, cfg.apiKey, model, method, args || [], kwargs || {}
   ]);
 }
 
-// ─── Outils MCP ──────────────────────────────────────────────────────────────
+// ─── MCP Tools ───────────────────────────────────────────────────────────────
 
 const TOOLS = [
-  {
-    name: "odoo_search_read",
-    description: "Recherche et lit des enregistrements dans n'importe quel modèle Odoo (res.partner, account.move, sale.order, project.task, etc.)",
+  { name: "odoo_search_read", description: "Recherche et lit des enregistrements dans n'importe quel modèle Odoo (res.partner, account.move, sale.order, project.task, etc.)",
     inputSchema: { type: "object", properties: {
       model: { type: "string" }, domain: { type: "array", items: { type: "array" }, default: [] },
       fields: { type: "array", items: { type: "string" }, default: [] },
-      limit: { type: "number", default: 20 }, offset: { type: "number", default: 0 },
-      order: { type: "string", default: "id desc" }
-    }, required: ["model"] }
-  },
-  {
-    name: "odoo_read_record",
-    description: "Lit un ou plusieurs enregistrements Odoo par leurs IDs",
+      limit: { type: "number", default: 20 }, offset: { type: "number", default: 0 }, order: { type: "string", default: "id desc" }
+    }, required: ["model"] }},
+  { name: "odoo_read_record", description: "Lit un ou plusieurs enregistrements Odoo par leurs IDs",
     inputSchema: { type: "object", properties: {
-      model: { type: "string" }, ids: { type: "array", items: { type: "number" } },
-      fields: { type: "array", items: { type: "string" }, default: [] }
-    }, required: ["model", "ids"] }
-  },
-  {
-    name: "odoo_get_fields",
-    description: "Retourne la définition des champs d'un modèle Odoo",
-    inputSchema: { type: "object", properties: {
-      model: { type: "string" }, filter_type: { type: "string" }
-    }, required: ["model"] }
-  },
-  {
-    name: "odoo_list_models",
-    description: "Liste tous les modèles disponibles dans l'instance Odoo",
-    inputSchema: { type: "object", properties: { search: { type: "string" } } }
-  },
-  {
-    name: "odoo_create_record",
-    description: "Crée un nouvel enregistrement dans un modèle Odoo (contact, facture, tâche, etc.)",
-    inputSchema: { type: "object", properties: {
-      model: { type: "string" }, values: { type: "object" }
-    }, required: ["model", "values"] }
-  },
-  {
-    name: "odoo_update_record",
-    description: "Met à jour des enregistrements existants dans Odoo",
+      model: { type: "string" }, ids: { type: "array", items: { type: "number" } }, fields: { type: "array", items: { type: "string" }, default: [] }
+    }, required: ["model", "ids"] }},
+  { name: "odoo_get_fields", description: "Retourne la définition des champs d'un modèle Odoo",
+    inputSchema: { type: "object", properties: { model: { type: "string" }, filter_type: { type: "string" } }, required: ["model"] }},
+  { name: "odoo_list_models", description: "Liste tous les modèles disponibles dans l'instance Odoo",
+    inputSchema: { type: "object", properties: { search: { type: "string" } } }},
+  { name: "odoo_create_record", description: "Crée un nouvel enregistrement dans un modèle Odoo (contact, facture, tâche, etc.)",
+    inputSchema: { type: "object", properties: { model: { type: "string" }, values: { type: "object" } }, required: ["model", "values"] }},
+  { name: "odoo_update_record", description: "Met à jour des enregistrements existants dans Odoo",
     inputSchema: { type: "object", properties: {
       model: { type: "string" }, ids: { type: "array", items: { type: "number" } }, values: { type: "object" }
-    }, required: ["model", "ids", "values"] }
-  },
-  {
-    name: "odoo_delete_record",
-    description: "Supprime des enregistrements Odoo par leurs IDs (ATTENTION: irréversible)",
-    inputSchema: { type: "object", properties: {
-      model: { type: "string" }, ids: { type: "array", items: { type: "number" } }
-    }, required: ["model", "ids"] }
-  },
-  {
-    name: "odoo_execute_method",
-    description: "Exécute une méthode Odoo (ex: action_confirm, action_post, action_cancel)",
+    }, required: ["model", "ids", "values"] }},
+  { name: "odoo_delete_record", description: "Supprime des enregistrements Odoo par leurs IDs (ATTENTION: irréversible)",
+    inputSchema: { type: "object", properties: { model: { type: "string" }, ids: { type: "array", items: { type: "number" } } }, required: ["model", "ids"] }},
+  { name: "odoo_execute_method", description: "Exécute une méthode Odoo (ex: action_confirm, action_post, action_cancel)",
     inputSchema: { type: "object", properties: {
       model: { type: "string" }, ids: { type: "array", items: { type: "number" }, default: [] },
       method: { type: "string" }, kwargs: { type: "object", default: {} }
-    }, required: ["model", "method"] }
-  }
+    }, required: ["model", "method"] }}
 ];
 
 async function executeTool(name, args) {
@@ -216,50 +243,47 @@ async function executeTool(name, args) {
   switch (name) {
     case "odoo_search_read": {
       const { model, domain=[], fields=[], limit=20, offset=0, order="id desc" } = args;
-      const records = await execute(cfg, uid, model, "search_read", [domain], { fields, limit, offset, order });
-      const total = await execute(cfg, uid, model, "search_count", [domain]);
-      return { model, total, count: (records||[]).length, records: records||[] };
+      const records = await exec(cfg, uid, model, "search_read", [domain], { fields, limit, offset, order });
+      const total = await exec(cfg, uid, model, "search_count", [domain]);
+      return { model, total, count: Array.isArray(records) ? records.length : 0, records: records || [] };
     }
     case "odoo_read_record": {
-      const { model, ids, fields=[] } = args;
-      const records = await execute(cfg, uid, model, "read", [ids], { fields });
-      return { model, records: records||[] };
+      const records = await exec(cfg, uid, args.model, "read", [args.ids], { fields: args.fields || [] });
+      return { model: args.model, records: records || [] };
     }
     case "odoo_get_fields": {
-      const { model, filter_type } = args;
-      let fields = await execute(cfg, uid, model, "fields_get", [], { attributes: ["string","type","required"] });
-      if (filter_type && fields) fields = Object.fromEntries(Object.entries(fields).filter(([,v]) => v.type === filter_type));
-      const count = fields ? Object.keys(fields).length : 0;
-      return { model, field_count: count, fields: fields ? Object.fromEntries(Object.entries(fields).slice(0, 80)) : {} };
+      const fields = await exec(cfg, uid, args.model, "fields_get", [], { attributes: ["string","type","required"] });
+      let result = fields || {};
+      if (args.filter_type) result = Object.fromEntries(Object.entries(result).filter(([,v]) => v.type === args.filter_type));
+      return { model: args.model, field_count: Object.keys(result).length, fields: Object.fromEntries(Object.entries(result).slice(0,80)) };
     }
     case "odoo_list_models": {
-      const { search } = args;
-      const domain = search ? [["model","like",search]] : [];
-      const models = await execute(cfg, uid, "ir.model", "search_read", [domain], { fields: ["name","model"], limit: 100, order: "model asc" });
-      return { count: (models||[]).length, models: models||[] };
+      const domain = args.search ? [["model","like",args.search]] : [];
+      const models = await exec(cfg, uid, "ir.model", "search_read", [domain], { fields: ["name","model"], limit: 100, order: "model asc" });
+      return { count: Array.isArray(models) ? models.length : 0, models: models || [] };
     }
     case "odoo_create_record": {
-      const newId = await execute(cfg, uid, args.model, "create", [args.values]);
-      return { success: true, model: args.model, new_id: newId };
+      const id = await exec(cfg, uid, args.model, "create", [args.values]);
+      return { success: true, model: args.model, new_id: id };
     }
     case "odoo_update_record": {
-      const ok = await execute(cfg, uid, args.model, "write", [args.ids, args.values]);
+      const ok = await exec(cfg, uid, args.model, "write", [args.ids, args.values]);
       return { success: ok, model: args.model, updated_ids: args.ids };
     }
     case "odoo_delete_record": {
-      const ok = await execute(cfg, uid, args.model, "unlink", [args.ids]);
+      const ok = await exec(cfg, uid, args.model, "unlink", [args.ids]);
       return { success: ok, model: args.model, deleted_ids: args.ids };
     }
     case "odoo_execute_method": {
       const { model, ids=[], method, kwargs={} } = args;
-      const result = await execute(cfg, uid, model, method, ids.length > 0 ? [ids] : [], kwargs);
+      const result = await exec(cfg, uid, model, method, ids.length ? [ids] : [], kwargs);
       return { success: true, model, method, result };
     }
     default: throw new Error("Outil inconnu: " + name);
   }
 }
 
-// ─── Handler Netlify ─────────────────────────────────────────────────────────
+// ─── Netlify Handler ─────────────────────────────────────────────────────────
 
 exports.handler = async function(event) {
   const headers = {
